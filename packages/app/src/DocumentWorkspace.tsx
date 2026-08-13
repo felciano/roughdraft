@@ -720,8 +720,9 @@ export function DocumentWorkspace({
 
   return (
     <div
+      data-testid="document-scroll-region"
       className={cn(
-        "min-h-0 flex-1 overflow-y-auto px-8 pb-8 sm:px-12",
+        "min-h-0 flex-1 overflow-y-auto px-[max(1.5rem,5%)] pb-8",
         conflictNotice ? "pt-40 sm:pt-28" : "pt-10",
       )}
     >
@@ -984,7 +985,7 @@ export function DocumentWorkspace({
           </div>
         </div>
       ) : null}
-      <div className="mx-auto min-h-full max-w-[1080px]">
+      <div className="min-h-full w-full">
         {documentPage ? (
           <div
             ref={documentHeaderRef}
@@ -995,7 +996,7 @@ export function DocumentWorkspace({
                 "review-layout-grid--centered document-page-shell-no-comments",
             )}
           >
-            <div className="review-layout-main document-page-main w-full max-w-[46.5rem] min-w-0">
+            <div className="review-layout-main document-page-main w-full min-w-0">
               <div className="flex w-full flex-wrap items-center gap-1.5 px-1">
                 <Tooltip>
                   <TooltipTrigger
