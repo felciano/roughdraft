@@ -1,8 +1,11 @@
 import {
-  MarkdownFileConflictError,
   type BackendInfo,
+  type CompleteReviewOptions,
+  type CompleteReviewResult,
+  MarkdownFileConflictError,
   type MarkdownFileChangeEvent,
   type Page,
+  type ReviewWatchStatus,
   type StorageBackend,
   type StoredAsset,
 } from "./storage";
@@ -221,6 +224,65 @@ export class RemoteBackend implements StorageBackend {
     return () => {
       source.close();
       this.setSessionStatus("disconnected");
+    };
+  }
+
+  // Done Reviewing. The host appends the overall comment to the session copy,
+  // forwards it to the CLI as a save, then ends `roughdraft open` with a
+  // review.completed event, just as local mode ends `roughdraft watch`.
+  async completeReview(
+    _relativePath: string,
+    options: CompleteReviewOptions = {},
+  ): Promise<CompleteReviewResult> {
+    const sessionId = this.info.sessionId;
+    if (!sessionId) {
+      throw new Error("Remote backend missing session id");
+    }
+    const overallComment = options.overallComment?.trim();
+    const response = await fetch(
+      `/api/remote-document/${encodeURIComponent(sessionId)}/review`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...this.authHeaders(),
+        },
+        body: JSON.stringify(overallComment ? { overallComment } : {}),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Failed to complete remote review: HTTP ${response.status}`,
+      );
+    }
+    const payload = (await response.json()) as { delivered?: unknown };
+    return { delivered: payload.delivered === true };
+  }
+
+  async getReviewWatchStatus(
+    _relativePath: string,
+  ): Promise<ReviewWatchStatus> {
+    const sessionId = this.info.sessionId;
+    if (!sessionId) {
+      return { watching: false, watcherCount: 0 };
+    }
+    const response = await fetch(
+      `/api/remote-document/${encodeURIComponent(sessionId)}/review-status`,
+      { headers: this.authHeaders() },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Failed to get remote review status: HTTP ${response.status}`,
+      );
+    }
+    const payload = (await response.json()) as {
+      watching?: unknown;
+      watcherCount?: unknown;
+    };
+    return {
+      watching: payload.watching === true,
+      watcherCount:
+        typeof payload.watcherCount === "number" ? payload.watcherCount : 0,
     };
   }
 

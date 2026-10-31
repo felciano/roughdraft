@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RemoteBackend } from "./remote-backend";
-import { MarkdownFileConflictError } from "./storage";
+import { MarkdownFileConflictError, type StorageBackend } from "./storage";
 
 describe("RemoteBackend", () => {
   const originalFetch = global.fetch;
@@ -266,5 +266,93 @@ describe("RemoteBackend", () => {
 
     stopWatching();
     expect(statuses).toEqual(["disconnected", "connected", "disconnected"]);
+  });
+
+  describe("Done Reviewing in remote mode", () => {
+    function tokenBackend(): StorageBackend {
+      return new RemoteBackend(
+        {
+          kind: "remote",
+          label: "Remote document",
+          detail: "draft.md",
+          sessionId: "session-1",
+          originPath: "/work/draft.md",
+        },
+        {
+          id: "session-1",
+          originPath: "/work/draft.md",
+          content: "v1",
+          version: "v",
+        },
+        "secret-token",
+      );
+    }
+
+    it("completeReview POSTs the overall comment to the session review route with the bearer token", async () => {
+      const fetchMock = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ delivered: true }), { status: 200 }),
+      );
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      const backend = tokenBackend();
+      expect(backend.completeReview).toBeTypeOf("function");
+      const result = await backend.completeReview?.("draft.md", {
+        overallComment: "Ship it after the risk section.",
+      });
+
+      expect(result).toEqual({ delivered: true });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [
+        string,
+        RequestInit,
+      ];
+      expect(url).toBe("/api/remote-document/session-1/review");
+      expect(init.method).toBe("POST");
+      expect(init.headers).toMatchObject({
+        "Content-Type": "application/json",
+        Authorization: "Bearer secret-token",
+      });
+      expect(JSON.parse(init.body as string)).toEqual({
+        overallComment: "Ship it after the risk section.",
+      });
+    });
+
+    it("completeReview reports delivered: false when no CLI is listening", async () => {
+      global.fetch = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ delivered: false }), { status: 200 }),
+      ) as unknown as typeof fetch;
+
+      const backend = bootstrap() as StorageBackend;
+      expect(backend.completeReview).toBeTypeOf("function");
+      await expect(backend.completeReview?.("draft.md")).resolves.toEqual({
+        delivered: false,
+      });
+    });
+
+    it("getReviewWatchStatus GETs the session review-status route", async () => {
+      const fetchMock = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ watching: true, watcherCount: 1 }), {
+            status: 200,
+          }),
+      );
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      const backend = tokenBackend();
+      expect(backend.getReviewWatchStatus).toBeTypeOf("function");
+      const status = await backend.getReviewWatchStatus?.("draft.md");
+
+      expect(status).toEqual({ watching: true, watcherCount: 1 });
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [
+        string,
+        RequestInit | undefined,
+      ];
+      expect(url).toBe("/api/remote-document/session-1/review-status");
+      expect(init?.headers).toMatchObject({
+        Authorization: "Bearer secret-token",
+      });
+    });
   });
 });

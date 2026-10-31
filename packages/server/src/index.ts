@@ -407,6 +407,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const openRequestClients = new Set<OpenRequestClient>();
   const reviewEvents = new ReviewEventQueue();
   const remoteSessions = new Map<string, RemoteSession>();
+  let remoteReviewSequence = 1;
 
   function isAuthorizedRemoteDocumentRequest(req: Request): boolean {
     if (!remoteDocumentToken) return true;
@@ -1011,6 +1012,87 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     }
 
     res.json({ id: session.id, version: session.version });
+  });
+
+  // Done Reviewing for a remote session: the remote counterpart of
+  // POST /api/review-events. The document lives on the CLI's machine, so the
+  // overall comment is appended to the session copy and sent to the CLI as an
+  // ordinary save, followed by review.completed, which ends `roughdraft open`.
+  // Its own sequence, so remote reviews never wake local-mode watchers.
+  app.post("/api/remote-document/:id/review", (req, res) => {
+    if (!isAuthorizedRemoteDocumentRequest(req)) {
+      rejectUnauthorizedRemoteDocumentRequest(res);
+      return;
+    }
+    const session = remoteSessions.get(req.params.id);
+    if (!session) {
+      res.status(404).json({ error: "Remote document session not found" });
+      return;
+    }
+
+    const overallComment = normalizeOverallComment(req.body?.overallComment);
+    if (
+      overallComment !== undefined &&
+      overallComment.length > MAX_OVERALL_COMMENT_LENGTH
+    ) {
+      res.status(400).json({
+        error: `overallComment must be ${MAX_OVERALL_COMMENT_LENGTH} characters or fewer`,
+      });
+      return;
+    }
+
+    if (overallComment) {
+      session.content = appendRoughdraftDocumentComment(session.content, {
+        message: overallComment,
+        author: "user",
+      });
+      session.version = remoteSessionVersion(session.content);
+    }
+
+    const event = {
+      type: "review.completed" as const,
+      documentPath: session.originPath,
+      projectPath: path.dirname(session.originPath),
+      relativePath: path.basename(session.originPath),
+      version: session.version,
+      summary: extractRoughdraftReviewIndex(session.content).summary,
+      ...(overallComment ? { overallComment } : {}),
+      sequence: remoteReviewSequence++,
+      createdAt: new Date().toISOString(),
+    };
+
+    let delivered = false;
+    if (session.saveClient) {
+      try {
+        if (overallComment) {
+          writeRemoteSessionEvent(session.saveClient, "save", {
+            content: session.content,
+            version: session.version,
+          });
+        }
+        writeRemoteSessionEvent(session.saveClient, "review.completed", event);
+        delivered = true;
+      } catch {
+        session.saveClient = null;
+        session.disconnectedAt = Date.now();
+      }
+    }
+
+    res.json({ delivered });
+  });
+
+  app.get("/api/remote-document/:id/review-status", (req, res) => {
+    if (!isAuthorizedRemoteDocumentRequest(req)) {
+      rejectUnauthorizedRemoteDocumentRequest(res);
+      return;
+    }
+    const session = remoteSessions.get(req.params.id);
+    if (!session) {
+      res.status(404).json({ error: "Remote document session not found" });
+      return;
+    }
+    const watching = session.saveClient !== null;
+    res.json({ watching, watcherCount: watching ? 1 : 0 });
   });
 
   app.get("/api/remote-document/:id/events", (req, res) => {
