@@ -1049,4 +1049,291 @@ describe("createApp", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+
+  describe("remote-document Done Reviewing", () => {
+    const originPath = "/work/notes/draft.md";
+    const reviewedContent = [
+      "# Draft",
+      "",
+      'Needs {==support==}{>>Add a source<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.',
+      "",
+    ].join("\n");
+
+    interface SseReader {
+      readUntil: (marker: string) => Promise<string>;
+      cancel: () => Promise<void>;
+    }
+
+    async function openCliStream(
+      port: number,
+      sessionId: string,
+    ): Promise<SseReader> {
+      const response = await fetch(
+        `http://127.0.0.1:${port}/api/remote-document/${sessionId}/events?role=cli`,
+      );
+      expect(response.status).toBe(200);
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("Expected SSE body");
+      const decoder = new TextDecoder();
+      let received = "";
+      const sse: SseReader = {
+        readUntil: async (marker) => {
+          while (!received.includes(marker)) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            received += decoder.decode(value, { stream: true });
+          }
+          return received;
+        },
+        cancel: async () => {
+          await reader.cancel();
+        },
+      };
+      await sse.readUntil("event: connected");
+      return sse;
+    }
+
+    function parseSseEvent(stream: string, eventName: string): unknown {
+      const block = stream
+        .replace(/\r\n/g, "\n")
+        .split("\n\n")
+        .find((candidate) => candidate.includes(`event: ${eventName}\n`));
+      if (!block) throw new Error(`No ${eventName} event in stream`);
+      const data = block
+        .split("\n")
+        .filter((line) => line.startsWith("data: "))
+        .map((line) => line.slice(6))
+        .join("\n");
+      return JSON.parse(data);
+    }
+
+    async function register(
+      app: ReturnType<typeof createApp>["app"],
+      sessionId: string,
+      token?: string,
+    ) {
+      const req = request(app).post("/api/remote-document");
+      if (token) req.set("Authorization", `Bearer ${token}`);
+      const response = await req.send({
+        sessionId,
+        originPath,
+        content: reviewedContent,
+      });
+      expect(response.status).toBe(201);
+      return response;
+    }
+
+    it("appends the overall comment, sends save then review.completed to the CLI stream, and reports delivered", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const sessionId = "review-delivered";
+      const registered = await register(app, sessionId);
+      const server = app.listen(0);
+      try {
+        const port = (server.address() as AddressInfo).port;
+        const cli = await openCliStream(port, sessionId);
+
+        const review = await fetch(
+          `http://127.0.0.1:${port}/api/remote-document/${sessionId}/review`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              overallComment: "Please address the risk section.",
+            }),
+          },
+        );
+        expect(review.status).toBe(200);
+        expect(await review.json()).toEqual({ delivered: true });
+
+        const stream = await cli.readUntil("event: review.completed");
+        await cli.cancel();
+
+        const saveIndex = stream.indexOf("event: save");
+        const completedIndex = stream.indexOf("event: review.completed");
+        expect(saveIndex).toBeGreaterThan(-1);
+        expect(completedIndex).toBeGreaterThan(saveIndex);
+
+        const save = parseSseEvent(stream, "save") as {
+          content: string;
+          version: string;
+        };
+        expect(save.content).toContain(
+          "    body: Please address the risk section.",
+        );
+        expect(save.content).toContain("    by: user");
+        expect(save.version).not.toBe(registered.body.version);
+
+        const completed = parseSseEvent(stream, "review.completed");
+        expect(completed).toMatchObject({
+          type: "review.completed",
+          documentPath: originPath,
+          relativePath: "draft.md",
+          projectPath: "/work/notes",
+          version: save.version,
+          overallComment: "Please address the risk section.",
+          summary: {
+            comments: 2,
+            replies: 0,
+            suggestions: 0,
+            unresolved: 2,
+          },
+          sequence: expect.any(Number),
+          createdAt: expect.any(String),
+        });
+
+        const session = await request(app).get(
+          `/api/remote-document/${sessionId}`,
+        );
+        expect(session.body.content).toBe(save.content);
+        expect(session.body.version).toBe(save.version);
+      } finally {
+        server.closeAllConnections?.();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    it("sends review.completed without a save when there is no overall comment", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const sessionId = "review-no-comment";
+      const registered = await register(app, sessionId);
+      const server = app.listen(0);
+      try {
+        const port = (server.address() as AddressInfo).port;
+        const cli = await openCliStream(port, sessionId);
+
+        const review = await fetch(
+          `http://127.0.0.1:${port}/api/remote-document/${sessionId}/review`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          },
+        );
+        expect(review.status).toBe(200);
+        expect(await review.json()).toEqual({ delivered: true });
+
+        const stream = await cli.readUntil("event: review.completed");
+        await cli.cancel();
+        expect(stream).not.toContain("event: save");
+        const completed = parseSseEvent(stream, "review.completed");
+        expect(completed).toMatchObject({
+          type: "review.completed",
+          version: registered.body.version,
+          summary: { comments: 1, unresolved: 1 },
+        });
+        expect(completed).not.toHaveProperty("overallComment");
+      } finally {
+        server.closeAllConnections?.();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    it("reports delivered: false when no CLI stream is connected", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      await register(app, "review-undelivered");
+
+      const response = await request(app)
+        .post("/api/remote-document/review-undelivered/review")
+        .send({});
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ delivered: false });
+    });
+
+    it("returns the remote-document 404 for an unknown session", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+
+      const response = await request(app)
+        .post("/api/remote-document/missing/review")
+        .send({});
+
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({
+        error: "Remote document session not found",
+      });
+    });
+
+    it("rejects an over-limit overall comment with 400", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      await register(app, "review-oversize");
+
+      const response = await request(app)
+        .post("/api/remote-document/review-oversize/review")
+        .send({ overallComment: "x".repeat(4_001) });
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toContain("4000 characters or fewer");
+    });
+
+    it("requires the bearer token on review and review-status when a token is configured", async () => {
+      const { app } = createApp({
+        homeDir,
+        staticDirPath: projectDir,
+        remoteDocumentToken: "secret-token",
+      });
+      await register(app, "review-auth", "secret-token");
+
+      const noTokenReview = await request(app)
+        .post("/api/remote-document/review-auth/review")
+        .send({});
+      expect(noTokenReview.status).toBe(401);
+
+      const wrongTokenReview = await request(app)
+        .post("/api/remote-document/review-auth/review")
+        .set("Authorization", "Bearer wrong")
+        .send({});
+      expect(wrongTokenReview.status).toBe(401);
+
+      const noTokenStatus = await request(app).get(
+        "/api/remote-document/review-auth/review-status",
+      );
+      expect(noTokenStatus.status).toBe(401);
+
+      const authorized = await request(app)
+        .post("/api/remote-document/review-auth/review")
+        .set("Authorization", "Bearer secret-token")
+        .send({});
+      expect(authorized.status).toBe(200);
+      expect(authorized.body).toEqual({ delivered: false });
+    });
+
+    it("review-status reports whether a CLI stream is watching the session", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const sessionId = "review-status";
+      await register(app, sessionId);
+
+      const before = await request(app).get(
+        `/api/remote-document/${sessionId}/review-status`,
+      );
+      expect(before.status).toBe(200);
+      expect(before.body).toEqual({ watching: false, watcherCount: 0 });
+
+      const server = app.listen(0);
+      try {
+        const port = (server.address() as AddressInfo).port;
+        const cli = await openCliStream(port, sessionId);
+
+        const during = await request(app).get(
+          `/api/remote-document/${sessionId}/review-status`,
+        );
+        expect(during.body).toEqual({ watching: true, watcherCount: 1 });
+
+        await cli.cancel();
+      } finally {
+        server.closeAllConnections?.();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    it("review-status returns 404 for an unknown session", async () => {
+      const { app } = createApp({ homeDir, staticDirPath: projectDir });
+      const response = await request(app).get(
+        "/api/remote-document/missing/review-status",
+      );
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({
+        error: "Remote document session not found",
+      });
+    });
+  });
 });

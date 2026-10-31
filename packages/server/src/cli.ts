@@ -1324,11 +1324,20 @@ async function runRemoteOpen(
   );
   eventsUrl.searchParams.set("role", "cli");
 
+  // The timeout bounds connecting, not the stream. A fetch signal also aborts
+  // the response body, so passing AbortSignal.timeout straight to fetch killed
+  // the stream ~10s after it opened and every later save was lost (#113).
+  // Forward it only until the response headers arrive.
+  const streamAbort = new AbortController();
+  const connectTimeout = AbortSignal.timeout(SSE_CONNECT_TIMEOUT_MS);
+  const abortConnect = () => streamAbort.abort(connectTimeout.reason);
+  connectTimeout.addEventListener("abort", abortConnect, { once: true });
+
   let eventsResponse: Response;
   try {
     eventsResponse = await deps.fetchImpl(eventsUrl.toString(), {
       headers: { Accept: "text/event-stream", ...authHeaders },
-      signal: AbortSignal.timeout(SSE_CONNECT_TIMEOUT_MS),
+      signal: streamAbort.signal,
     });
   } catch (error) {
     deps.error(
@@ -1337,6 +1346,8 @@ async function runRemoteOpen(
       }`,
     );
     return 1;
+  } finally {
+    connectTimeout.removeEventListener("abort", abortConnect);
   }
 
   if (!eventsResponse.ok || !eventsResponse.body) {
@@ -1349,9 +1360,10 @@ async function runRemoteOpen(
   const reader = eventsResponse.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let completed: unknown = null;
 
   try {
-    while (true) {
+    while (completed === null) {
       let chunk: ReadableStreamReadResult<Uint8Array>;
       try {
         chunk = await reader.read();
@@ -1384,15 +1396,39 @@ async function runRemoteOpen(
               );
             }
           }
+        } else if (event.event === "review.completed") {
+          // Done Reviewing. The host sends any final save first, and events
+          // are handled in order, so the file is already current here.
+          try {
+            completed = JSON.parse(event.data) as unknown;
+          } catch {
+            continue;
+          }
+          break;
         }
       }
     }
   } finally {
     try {
+      await reader.cancel();
+    } catch {
+      // The stream may already be closed or errored; ignore.
+    }
+    try {
       reader.releaseLock();
     } catch {
       // The stream may already be in an errored state; ignore.
     }
+  }
+
+  if (completed !== null) {
+    // Same output as local mode's watch, so an agent handles both alike.
+    if (options.json) {
+      emitJson(deps.log, { events: [completed], timedOut: false });
+    } else {
+      deps.log(`Review completed for ${options.openPath}.`);
+    }
+    return 0;
   }
 
   if (!options.json) {

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateRoughdraftMarkdown } from "@roughdraft/rfm";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createCliDependencies,
   createDefaultOpenUrl,
@@ -2382,5 +2382,267 @@ describe("runCli open in remote mode", () => {
       await browserEventsReader?.cancel().catch(() => undefined);
       await remote.close();
     }
+  });
+
+  const updateStatus = async () => ({
+    packageName: "roughdraft",
+    currentVersion: "0.1.0",
+    latestVersion: "0.1.0",
+    updateAvailable: false,
+    updateCommand: "",
+  });
+
+  async function settleWithin<T>(
+    promise: Promise<T>,
+    ms: number,
+  ): Promise<{ settled: true; value: T } | { settled: false }> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<{ settled: false }>((resolve) => {
+      timer = setTimeout(() => resolve({ settled: false }), ms);
+    });
+    try {
+      return await Promise.race([
+        promise.then((value) => ({ settled: true as const, value })),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function waitFor(predicate: () => boolean, ms = 4000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (!predicate() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  it("keeps the save-back stream open after the connect timeout elapses", {
+    timeout: 15_000,
+  }, async () => {
+    // Bug A: the SSE connect timeout was passed as the fetch signal, so it
+    // also aborted the response body ~10s after connecting. Compress every
+    // AbortSignal.timeout to 300ms so "after the connect timeout" takes
+    // milliseconds instead of ten seconds.
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeoutSpy = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockImplementation((ms: number) => realTimeout(Math.min(ms, 300)));
+    const remote = await startRemoteHost();
+    try {
+      const filePath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(filePath, "before\n");
+
+      const logs: string[] = [];
+      const errors: string[] = [];
+      let openedUrl: string | null = null;
+
+      const cliPromise = runCli(["open", filePath], {
+        env: { ROUGHDRAFT_HOST: remote.url },
+        cwd: projectDir,
+        log: (m) => logs.push(m),
+        error: (m) => errors.push(m),
+        openUrl: (url) => {
+          openedUrl = url;
+          return "disabled";
+        },
+        resolveUpdateStatus: updateStatus,
+      });
+
+      await waitFor(() => openedUrl !== null);
+      expect(openedUrl).not.toBeNull();
+      const sessionId = new URL(
+        openedUrl as unknown as string,
+      ).searchParams.get("session");
+
+      // Let the (compressed) connect timeout elapse well after the stream
+      // is open.
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      expect(logs).not.toContain("Remote session disconnected.");
+
+      const putResponse = await fetch(
+        `${remote.url}/api/remote-document/${sessionId}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: "after-timeout\n" }),
+        },
+      );
+      expect(putResponse.status).toBe(200);
+
+      await waitFor(
+        () => fs.readFileSync(filePath, "utf-8") === "after-timeout\n",
+      );
+      expect(fs.readFileSync(filePath, "utf-8")).toBe("after-timeout\n");
+
+      await remote.close();
+      expect(await cliPromise).toBe(0);
+      expect(errors).toEqual([]);
+    } finally {
+      timeoutSpy.mockRestore();
+      await remote.close();
+    }
+  });
+
+  describe("Done Reviewing", () => {
+    interface StubHost {
+      url: string;
+      cliConnected: () => boolean;
+      send: (event: string, data: unknown) => void;
+      close: () => Promise<void>;
+    }
+
+    // A minimal remote host that registers the session and holds the CLI
+    // stream open, so the test controls exactly which events the CLI sees
+    // and the stream never ends on its own.
+    async function startStubHost(sessionId: string): Promise<StubHost> {
+      let cliStream: import("node:http").ServerResponse | null = null;
+      const server = createHttpServer((req, res) => {
+        const url = new URL(req.url ?? "/", "http://stub");
+        if (req.method === "POST" && url.pathname === "/api/remote-document") {
+          req.resume();
+          req.on("end", () => {
+            res.writeHead(201, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                id: sessionId,
+                version: "v1",
+                viewerUrl: `http://stub/?session=${sessionId}`,
+              }),
+            );
+          });
+          return;
+        }
+        if (
+          req.method === "GET" &&
+          url.pathname.startsWith("/api/remote-document/") &&
+          url.pathname.endsWith("/events")
+        ) {
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+          res.write(
+            `event: connected\ndata: ${JSON.stringify({ id: sessionId, role: "cli" })}\n\n`,
+          );
+          cliStream = res;
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+      await new Promise<void>((resolve) =>
+        server.listen(0, "127.0.0.1", () => resolve()),
+      );
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Failed to bind stub host");
+      }
+      return {
+        url: `http://127.0.0.1:${address.port}`,
+        cliConnected: () => cliStream !== null,
+        send: (event, data) => {
+          cliStream?.write(
+            `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`,
+          );
+        },
+        close: () =>
+          new Promise<void>((resolve) => {
+            server.closeAllConnections?.();
+            server.close(() => resolve());
+          }),
+      };
+    }
+
+    function reviewCompletedEvent(filePath: string) {
+      return {
+        type: "review.completed",
+        documentPath: filePath,
+        projectPath: path.dirname(filePath),
+        relativePath: path.basename(filePath),
+        version: "v2",
+        summary: { comments: 2, replies: 0, suggestions: 0, unresolved: 2 },
+        overallComment: "Please address the risk section.",
+        sequence: 1,
+        createdAt: "2026-10-31T12:00:00.000Z",
+      };
+    }
+
+    it("writes the final save and exits 0 with the watch JSON shape on review.completed", {
+      timeout: 15_000,
+    }, async () => {
+      const sessionId = "11111111-1111-4111-8111-111111111111";
+      const host = await startStubHost(sessionId);
+      try {
+        const filePath = path.join(projectDir, "draft.md");
+        fs.writeFileSync(filePath, "before\n");
+        const finalContent =
+          "before\n\n---\ncomments:\n  c2:\n    body: Please address the risk section.\n    by: user\n";
+
+        const logs: string[] = [];
+        const errors: string[] = [];
+        const cliPromise = runCli(["open", filePath, "--json"], {
+          env: { ROUGHDRAFT_HOST: host.url },
+          cwd: projectDir,
+          log: (m) => logs.push(m),
+          error: (m) => errors.push(m),
+          openUrl: () => "disabled",
+          resolveUpdateStatus: updateStatus,
+        });
+
+        await waitFor(host.cliConnected);
+        expect(host.cliConnected()).toBe(true);
+
+        const event = reviewCompletedEvent(filePath);
+        host.send("save", { content: finalContent, version: "v2" });
+        host.send("review.completed", event);
+
+        // The host keeps the stream open: only review.completed can end it.
+        const outcome = await settleWithin(cliPromise, 3000);
+        expect(outcome.settled).toBe(true);
+        expect(outcome.settled && outcome.value).toBe(0);
+
+        expect(fs.readFileSync(filePath, "utf-8")).toBe(finalContent);
+        expect(errors).toEqual([]);
+        expect(JSON.parse(logs[logs.length - 1] ?? "null")).toEqual({
+          events: [event],
+          timedOut: false,
+        });
+      } finally {
+        await host.close();
+      }
+    });
+
+    it("logs the completion and exits 0 on review.completed without --json", {
+      timeout: 15_000,
+    }, async () => {
+      const sessionId = "22222222-2222-4222-8222-222222222222";
+      const host = await startStubHost(sessionId);
+      try {
+        const filePath = path.join(projectDir, "draft.md");
+        fs.writeFileSync(filePath, "before\n");
+
+        const logs: string[] = [];
+        const cliPromise = runCli(["open", filePath], {
+          env: { ROUGHDRAFT_HOST: host.url },
+          cwd: projectDir,
+          log: (m) => logs.push(m),
+          error: () => {},
+          openUrl: () => "disabled",
+          resolveUpdateStatus: updateStatus,
+        });
+
+        await waitFor(host.cliConnected);
+        host.send("review.completed", reviewCompletedEvent(filePath));
+
+        const outcome = await settleWithin(cliPromise, 3000);
+        expect(outcome.settled).toBe(true);
+        expect(outcome.settled && outcome.value).toBe(0);
+        expect(logs).toContain(`Review completed for ${filePath}.`);
+      } finally {
+        await host.close();
+      }
+    });
   });
 });
