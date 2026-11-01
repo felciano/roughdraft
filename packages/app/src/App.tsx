@@ -1653,7 +1653,9 @@ export function App() {
       ? formatWorkspacePathForDisplay(
           backend?.info.projectPath
             ? joinPath(backend.info.projectPath, activeDocumentPath)
-            : requestedPathState.rawPath,
+            : backend?.info.kind === "remote"
+              ? backend.info.originPath
+              : requestedPathState.rawPath,
         )
       : null;
 
@@ -1915,7 +1917,12 @@ export function App() {
     return <PreviewPage />;
   }
 
-  if (!requestedPathState.rawPath || loadError) {
+  // A remote session link (`?session=…`) never carries `path`; its document
+  // comes from the session, so it must not fall through to the homepage.
+  const remoteOriginPath =
+    backend?.info.kind === "remote" ? backend.info.originPath : undefined;
+
+  if ((!requestedPathState.rawPath && !remoteOriginPath) || loadError) {
     return (
       <Homepage
         message={loadError ?? <HomepageSubtitle />}
@@ -1927,7 +1934,7 @@ export function App() {
   const documentAbsolutePath =
     activeDocumentPath && backend?.info.projectPath
       ? joinPath(backend.info.projectPath, activeDocumentPath)
-      : requestedPathState.rawPath;
+      : (remoteOriginPath ?? requestedPathState.rawPath);
   const documentFilenameLabel =
     getPathLeaf(documentAbsolutePath ?? activeDocumentPath) ?? "Untitled.md";
 
