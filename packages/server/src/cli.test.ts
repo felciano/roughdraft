@@ -2555,6 +2555,44 @@ describe("runCli open in remote mode", () => {
       };
     }
 
+    it("builds the viewer link on the configured host, not the origin the server saw", {
+      timeout: 15_000,
+    }, async () => {
+      // Behind a TLS proxy the server sees plain http and its own host, so its
+      // viewerUrl names the wrong origin. The CLI was given the public address
+      // in ROUGHDRAFT_HOST and must hand that one out.
+      const sessionId = "33333333-3333-4333-8333-333333333333";
+      const host = await startStubHost(sessionId);
+      try {
+        const filePath = path.join(projectDir, "draft.md");
+        fs.writeFileSync(filePath, "before\n");
+
+        const opened: string[] = [];
+        const cliPromise = runCli(["open", filePath], {
+          env: { ROUGHDRAFT_HOST: `${host.url}/`, ROUGHDRAFT_TOKEN: "tok" },
+          cwd: projectDir,
+          log: () => {},
+          error: () => {},
+          openUrl: (url: string) => {
+            opened.push(url);
+            return "disabled";
+          },
+          resolveUpdateStatus: updateStatus,
+        });
+
+        await waitFor(host.cliConnected);
+        host.send("review.completed", reviewCompletedEvent(filePath));
+        const outcome = await settleWithin(cliPromise, 3000);
+        expect(outcome.settled).toBe(true);
+
+        expect(opened).toEqual([
+          `${host.url}/?session=${sessionId}&token=tok`,
+        ]);
+      } finally {
+        await host.close();
+      }
+    });
+
     function reviewCompletedEvent(filePath: string) {
       return {
         type: "review.completed",
