@@ -1195,6 +1195,25 @@ async function atomicWriteFile(
   await fs.promises.rename(tmpPath, targetPath);
 }
 
+// The server builds viewerUrl from the request it saw. Behind a TLS proxy that
+// is plain http on an internal host, so the link would name the wrong scheme
+// and origin. Keep the server's path and query, and put them on the address
+// the CLI was configured with, which is the one the browser can reach.
+function viewerOnConfiguredHost(
+  baseUrl: string,
+  serverViewerUrl: unknown,
+  sessionId: string,
+): string {
+  const fallback = `${baseUrl}/?session=${encodeURIComponent(sessionId)}`;
+  if (typeof serverViewerUrl !== "string") return fallback;
+  try {
+    const parsed = new URL(serverViewerUrl);
+    return `${baseUrl}${parsed.pathname}${parsed.search}`;
+  } catch {
+    return fallback;
+  }
+}
+
 function appendTokenToViewerUrl(viewerUrl: string, token: string): string {
   if (token.length === 0) return viewerUrl;
   try {
@@ -1288,10 +1307,11 @@ async function runRemoteOpen(
   // EventSource connection authenticate. The server's viewerUrl response field
   // is unaware of the token (it doesn't see secrets in plaintext over the wire
   // unless we add them); the CLI knows the token and can append it.
-  const baseViewer =
-    typeof registerPayload.viewerUrl === "string"
-      ? registerPayload.viewerUrl
-      : `${baseUrl}/?session=${encodeURIComponent(sessionId)}`;
+  const baseViewer = viewerOnConfiguredHost(
+    baseUrl,
+    registerPayload.viewerUrl,
+    sessionId,
+  );
   const viewerUrl = appendTokenToViewerUrl(baseViewer, remoteToken);
 
   if (options.printUrl) {
