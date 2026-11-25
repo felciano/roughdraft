@@ -34,10 +34,5 @@ jobs:
       - name: Run browser smoke tests
         run: pnpm test:smoke
 
-      # TEMPORARY (PR #5): run the full e2e suite once so the non-smoke
-      # Mermaid and wide-rail specs get a real-browser run. Remove before merge.
-      - name: Run full e2e suite (temporary)
-        run: pnpm test:e2e
-
       - name: Run coverage thresholds
         run: pnpm test:coverage
