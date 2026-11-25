@@ -323,11 +323,41 @@ export function appendYamlEndmatter(
     : markdown;
 }
 
+// Inline HTML tags the rich-text schema can represent and serialize back to
+// Markdown. Any other inline tag (`<time>`, `<kbd>`, `<placeholder>`) would be
+// silently dropped by the editor, so it is rendered as literal text instead.
+const editorRepresentableInlineTags = new Set([
+  "a",
+  "b",
+  "br",
+  "code",
+  "del",
+  "em",
+  "i",
+  "s",
+  "strike",
+  "strong",
+]);
+
+function isEditorRepresentableInlineHtml(raw: string): boolean {
+  const tag = /^<\/?([A-Za-z][A-Za-z0-9-]*)/.exec(raw)?.[1];
+  return (
+    tag !== undefined && editorRepresentableInlineTags.has(tag.toLowerCase())
+  );
+}
+
 export function createMarkedRenderer(options?: MarkdownOptions) {
   const renderer = new marked.Renderer();
   const baseRenderer = new marked.Renderer();
   const resolveFileUrl = options?.resolveFileUrl;
   const resolveLinkUrl = options?.resolveLinkUrl;
+
+  renderer.html = (token) => {
+    if (token.block || isEditorRepresentableInlineHtml(token.text)) {
+      return token.text;
+    }
+    return escapeHtml(token.text);
+  };
 
   renderer.code = ({ text, lang, escaped }) => {
     const language = (lang || "").match(/\S+/)?.[0];
