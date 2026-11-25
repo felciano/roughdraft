@@ -2585,9 +2585,7 @@ describe("runCli open in remote mode", () => {
         const outcome = await settleWithin(cliPromise, 3000);
         expect(outcome.settled).toBe(true);
 
-        expect(opened).toEqual([
-          `${host.url}/?session=${sessionId}&token=tok`,
-        ]);
+        expect(opened).toEqual([`${host.url}/?session=${sessionId}&token=tok`]);
       } finally {
         await host.close();
       }
