@@ -73,8 +73,24 @@ function protectIndentedCodeAfterLists(markdown: string): string {
   );
 }
 
+function closesCodeSpansInsideCell(cell: string): boolean {
+  if (cell.includes("\\`")) return false;
+  const runs = Array.from(cell.matchAll(/`+/g), ([run]) => run);
+  for (let index = 0; index < runs.length; index += 1) {
+    const closing = runs.indexOf(runs[index] ?? "", index + 1);
+    if (closing === -1) return false;
+    index = closing;
+  }
+  return true;
+}
+
 function codeSpanContainsPipe(value: string): boolean {
-  return /`[^`\n]*\|[^`\n]*`/.test(value);
+  return (
+    /`[^`\n]*\|[^`\n]*`/.test(value) &&
+    !value
+      .split(/\r?\n/)
+      .every((row) => row.split("|").every(closesCodeSpansInsideCell))
+  );
 }
 
 function protectPipeSensitiveTables(markdown: string): string {
@@ -307,11 +323,41 @@ export function appendYamlEndmatter(
     : markdown;
 }
 
+// Inline HTML tags the rich-text schema can represent and serialize back to
+// Markdown. Any other inline tag (`<time>`, `<kbd>`, `<placeholder>`) would be
+// silently dropped by the editor, so it is rendered as literal text instead.
+const editorRepresentableInlineTags = new Set([
+  "a",
+  "b",
+  "br",
+  "code",
+  "del",
+  "em",
+  "i",
+  "s",
+  "strike",
+  "strong",
+]);
+
+function isEditorRepresentableInlineHtml(raw: string): boolean {
+  const tag = /^<\/?([A-Za-z][A-Za-z0-9-]*)/.exec(raw)?.[1];
+  return (
+    tag !== undefined && editorRepresentableInlineTags.has(tag.toLowerCase())
+  );
+}
+
 export function createMarkedRenderer(options?: MarkdownOptions) {
   const renderer = new marked.Renderer();
   const baseRenderer = new marked.Renderer();
   const resolveFileUrl = options?.resolveFileUrl;
   const resolveLinkUrl = options?.resolveLinkUrl;
+
+  renderer.html = (token) => {
+    if (token.block || isEditorRepresentableInlineHtml(token.text)) {
+      return token.text;
+    }
+    return escapeHtml(token.text);
+  };
 
   renderer.code = ({ text, lang, escaped }) => {
     const language = (lang || "").match(/\S+/)?.[0];
