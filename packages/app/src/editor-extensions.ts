@@ -815,7 +815,7 @@ export function createEditorExtensions(placeholder: string) {
   return [
     StarterKit.configure({
       heading: {
-        levels: [1, 2, 3],
+        levels: [1, 2, 3, 4, 5, 6],
       },
       code: false,
       codeBlock: false,
