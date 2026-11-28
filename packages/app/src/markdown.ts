@@ -285,15 +285,31 @@ export function splitYamlDocumentMetadata(
   markdown: string,
 ): YamlDocumentMetadataSplit {
   const { frontmatter, body } = splitYamlFrontmatter(markdown);
-  const matches = [...body.matchAll(/\n---[ \t]*\r?\n/g)];
-  const match = matches.at(-1);
+  const matches = [...body.matchAll(/\n---[ \t]*(?:\r?\n|$)/g)];
+  let match = matches.at(-1);
 
   if (!match || match.index === undefined) {
     return { frontmatter, body, endmatter: null };
   }
 
-  const endmatter = body.slice(match.index);
-  const candidate = endmatter.replace(/^\n/, "");
+  // Tolerate a closing `---` after the endmatter (front-matter style): if the
+  // final delimiter has nothing after it, read the block before it instead.
+  // The canonical form written back has no closing delimiter.
+  let endmatterEnd = body.length;
+  const previous = matches.at(-2);
+  if (
+    body.slice(match.index + match[0].length).trim() === "" &&
+    previous?.index !== undefined &&
+    isRoughdraftReviewEndmatter(
+      body.slice(previous.index, match.index).replace(/^\n/, ""),
+    )
+  ) {
+    endmatterEnd = match.index;
+    match = previous;
+  }
+
+  const endmatter = body.slice(match.index, endmatterEnd);
+  const candidate = `${endmatter.replace(/^\n/, "").replace(/\s*$/, "")}\n`;
 
   const precedingBody = body.slice(0, match.index);
   if (!isRoughdraftReviewEndmatter(candidate)) {
