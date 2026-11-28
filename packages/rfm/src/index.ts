@@ -1166,12 +1166,47 @@ function hasDocumentLevelComment(parsed: Record<string, unknown>): boolean {
   return false;
 }
 
+function isReviewEndmatterYaml(yaml: string): boolean {
+  try {
+    const parsed = parseYaml(yaml) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return false;
+    }
+    const { comments, suggestions } = parsed as Record<string, unknown>;
+    return [comments, suggestions].some(
+      (value) =>
+        Boolean(value) && typeof value === "object" && !Array.isArray(value),
+    );
+  } catch {
+    return false;
+  }
+}
+
 function findFinalYamlEndmatter(
   markdown: string,
 ): { raw: string; yaml: string; offset: number } | null {
-  const matches = [...markdown.matchAll(/\n---[ \t]*\r?\n/g)];
+  const matches = [...markdown.matchAll(/\n---[ \t]*(?:\r?\n|$)/g)];
   const last = matches.at(-1);
   if (!last || last.index === undefined) return null;
+
+  // Tolerate a closing `---` after the endmatter (front-matter style): when
+  // the final delimiter has nothing after it, the YAML is the block before it.
+  const previous = matches.at(-2);
+  if (
+    markdown.slice(last.index + last[0].length).trim() === "" &&
+    previous?.index !== undefined
+  ) {
+    const yaml = markdown
+      .slice(previous.index, last.index)
+      .replace(/^\n---[ \t]*\r?\n/, "");
+    if (isReviewEndmatterYaml(yaml)) {
+      return {
+        raw: markdown.slice(previous.index),
+        yaml,
+        offset: previous.index,
+      };
+    }
+  }
 
   const raw = markdown.slice(last.index);
   return {
